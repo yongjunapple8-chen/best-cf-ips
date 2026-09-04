@@ -18,8 +18,14 @@ jobs:
 
       - name: Set up Cloudflare Speed Test
         run: |
-          # 下载最新的 CloudflareSpeedTest 工具
-          wget https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/CloudflareSpeedTest_linux_amd64.tar.gz
+          # 动态获取最新 Release 中匹配 linux_amd64 的实际下载链接
+          DOWNLOAD_URL=$(curl -s https://api.github.com/repos/XIU2/CloudflareSpeedTest/releases/latest \
+            | grep "browser_download_url.*linux_amd64.tar.gz" \
+            | cut -d : -f 2,3 \
+            | tr -d '\" ')
+
+          echo "Downloading from: $DOWNLOAD_URL"
+          wget -q -O CloudflareSpeedTest_linux_amd64.tar.gz "$DOWNLOAD_URL"
           tar -zxf CloudflareSpeedTest_linux_amd64.tar.gz
           chmod +x CloudflareST
 
