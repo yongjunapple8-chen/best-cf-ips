@@ -18,7 +18,6 @@ jobs:
 
       - name: Set up Cloudflare Speed Test
         run: |
-          # 动态获取最新 Release 中匹配 linux_amd64 的实际下载链接
           DOWNLOAD_URL=$(curl -s https://api.github.com/repos/XIU2/CloudflareSpeedTest/releases/latest \
             | grep "browser_download_url.*linux_amd64.tar.gz" \
             | cut -d : -f 2,3 \
@@ -26,15 +25,26 @@ jobs:
 
           echo "Downloading from: $DOWNLOAD_URL"
           wget -q -O CloudflareSpeedTest_linux_amd64.tar.gz "$DOWNLOAD_URL"
+          
+          # 解压并查看解压出的文件名
           tar -zxf CloudflareSpeedTest_linux_amd64.tar.gz
-          chmod +x CloudflareST
+          ls -la
+
+          # 赋予所有可执行权限
+          chmod +x CloudflareST* 2>/dev/null || chmod +x cfst* 2>/dev/null || chmod +x *
 
       - name: Run Speed Test
         run: |
-          # 运行测速，筛选前 20 个延迟最低、速度较快的 IPv4 并输出至 best-cf-ipv4.txt
-          ./CloudflareST -o result.csv -p 20 -tl 250 -dn 5
-          awk -F',' 'NR>1 {print $1}' result.csv > best-cf-ipv4.txt
+          # 自动寻找解压出的测速可执行程序运行
+          EXEC_FILE=$(ls | grep -E '^(CloudflareST|cfst)' | head -n 1)
+          if [ -z "$EXEC_FILE" ]; then
+            # 如果没匹配到，退而求其次寻找除了压缩包外的可执行文件
+            EXEC_FILE=$(find . -maxdepth 1 -type f -executable ! -name "*.tar.gz" ! -name "*.sh" | head -n 1)
+          fi
 
+          echo "Executing: $EXEC_FILE"
+          ./"$EXEC_FILE" -o result.csv -p 20 -tl 250 -dn 5
+          awk -F',' 'NR>1 {print $1}' result.csv > best-cf-ipv4.txt
       - name: Commit and Push Updated File
         run: |
           git config --global user.name "github-actions[bot]"
