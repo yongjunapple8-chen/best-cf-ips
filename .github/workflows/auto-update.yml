@@ -49,26 +49,26 @@ jobs:
 
           echo "Running in directory: $EXEC_DIR"
 
-          # 切换进程序目录运行
+          # 切换进程序目录运行，测出尽量多的 IP 供后续分组筛选
           cd "$EXEC_DIR"
-          ./$(basename "$EXEC_PATH") -o result.csv -p 20 -tl 250 -dn 5
+          ./$(basename "$EXEC_PATH") -o result.csv -p 100 -tl 300 -dn 5
 
-          # 提取当前测速出的 IP 暂存至 my_tested_ips.txt
-          awk -F',' 'NR>1 {print $1}' result.csv > "$GITHUB_WORKSPACE/my_tested_ips.txt"
+          # 提取当前测速的 IP 和延迟数据保存至 result_parsed.csv
+          awk -F',' 'NR>1 {print $1","$5}' result.csv > "$GITHUB_WORKSPACE/result_parsed.csv"
 
-      - name: Aggregate, Deduplicate & Annotate IPs
+      - name: Aggregate, Filter Top 10 Per Region & Annotate
         run: |
           python - << 'EOF'
           import re
           import requests
           import urllib.request
           import os
+          from collections import defaultdict
 
           # 1. 聚合源配置：在此处可添加更多公开/开源优选 IP 列表的 Raw URL
           SOURCES = [
-              "file://my_tested_ips.txt", # 本地刚测速出来的 IP
               "https://raw.githubusercontent.com/LancelotRar/best-cf-ips/main/best-cf-ipv4.txt",
-              # 示例：你可以取消注释或添加更多第三方开源源
+              # 示例：可添加更多第三方开源源
               # "https://raw.githubusercontent.com/31b9/Cloudflare-IPSpeedTest/main/best-cf-ipv4.txt",
           ]
 
@@ -94,58 +94,78 @@ jobs:
               return results
 
           def main():
-              raw_ips = set()
+              ip_delay_map = {} # ip -> delay (ms)
               ip_pattern = re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b')
 
-              # 从所有源抓取 IP 并去重
+              # 1. 读取本地测速结果（带精确延迟）
+              local_csv = "result_parsed.csv"
+              if os.path.exists(local_csv):
+                  with open(local_csv, "r", encoding="utf-8") as f:
+                      for line in f:
+                          parts = line.strip().split(",")
+                          if len(parts) == 2:
+                              ip, delay_str = parts[0], parts[1]
+                              try:
+                                  ip_delay_map[ip] = float(delay_str)
+                              except ValueError:
+                                  pass
+
+              # 2. 从外部公开源拉取 IP（没有延迟数据的默认赋予 999ms 兜底）
               for url in SOURCES:
                   try:
-                      if url.startswith("file://"):
-                          path = url.replace("file://", "")
-                          if os.path.exists(path):
-                              with open(path, "r", encoding="utf-8") as f:
-                                  matches = ip_pattern.findall(f.read())
-                                  raw_ips.update(matches)
-                                  print(f"Loaded {len(matches)} IPs from local file")
-                      else:
-                          req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                          with urllib.request.urlopen(req, timeout=10) as response:
-                              content = response.read().decode('utf-8')
-                              matches = ip_pattern.findall(content)
-                              raw_ips.update(matches)
-                              print(f"Fetched {len(matches)} IPs from {url}")
+                      req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                      with urllib.request.urlopen(req, timeout=10) as response:
+                          content = response.read().decode('utf-8')
+                          matches = ip_pattern.findall(content)
+                          for ip in matches:
+                              if ip not in ip_delay_map:
+                                  ip_delay_map[ip] = 999.0 # 未直接测速的 IP 设置较大延迟值
                   except Exception as e:
                       print(f"Failed to fetch {url}: {e}")
 
-              ip_list = sorted(list(raw_ips))
-              print(f"Total unique IPs collected: {len(ip_list)}")
-
-              if not ip_list:
+              if not ip_delay_map:
                   print("No IPs found, skipped updating.")
                   return
 
-              # 获取 GeoIP 并格式化输出
-              geoip_map = batch_geoip_lookup(ip_list)
-              output_lines = []
+              all_ips = list(ip_delay_map.keys())
+              print(f"Total unique IPs collected: {len(all_ips)}")
 
-              for ip in ip_list:
+              # 3. 批量查询 GeoIP 国家信息
+              geoip_map = batch_geoip_lookup(all_ips)
+
+              # 4. 按国家地区（Country Code）分组并按延迟排序
+              region_grouped = defaultdict(list)
+              for ip in all_ips:
                   country_code = geoip_map.get(ip, "UNK")
+                  delay = ip_delay_map.get(ip, 999.0)
+                  region_grouped[country_code].append((ip, delay))
+
+              output_lines = []
+              
+              # 按国家代码字母顺序排列输出
+              for country_code in sorted(region_grouped.keys()):
+                  # 对该地区内的 IP 按延迟从小到大排序
+                  sorted_ips = sorted(region_grouped[country_code], key=lambda x: x[1])
+                  # 核心：每个地区仅截取前 10 个延迟最低的 IP
+                  top10_ips = sorted_ips[:10]
+                  
                   flag = get_flag_emoji(country_code)
-                  # 输出格式: IP地址:443#国家代码 国旗
-                  output_lines.append(f"{ip}:443#{country_code} {flag}")
+                  for ip, delay in top10_ips:
+                      # 格式: IP地址:443#国家代码 国旗
+                      output_lines.append(f"{ip}:443#{country_code} {flag}")
 
               # 写入 best-cf-ipv4.txt 文件
               with open("best-cf-ipv4.txt", "w", encoding="utf-8") as f:
                   f.write("\n".join(output_lines) + "\n")
 
-              print("best-cf-ipv4.txt successfully generated.")
+              print(f"Filtering complete. Generated best-cf-ipv4.txt with {len(output_lines)} total IPs.")
 
           if __name__ == "__main__":
               main()
           EOF
 
       - name: Clean Temporary Files
-        run: rm -f my_tested_ips.txt
+        run: rm -f result_parsed.csv
 
       - name: Commit and Push Updated File
         run: |
@@ -156,7 +176,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes in IP list."
           else
-            git commit -m "auto: aggregate & update best-cf-ipv4.txt [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+            git commit -m "auto: aggregate & limit top 10 IPs per region [$(date -u +'%Y-%m-%d %H:%M UTC')]"
             git push
           fi
 
@@ -165,7 +185,7 @@ jobs:
         with:
           tag_name: "v${{ github.run_number }}"
           name: "Auto Updated IPs (${{ format('{0}', github.event.head_commit.timestamp || 'Latest') }})"
-          body: "Automatically generated and aggregated Cloudflare IPv4 list with GeoIP flags."
+          body: "Automatically generated list of best Cloudflare IPv4 addresses (Top 10 lowest latency IPs per region)."
           files: |
             best-cf-ipv4.txt
           draft: false
