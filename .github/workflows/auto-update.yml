@@ -1,0 +1,56 @@
+name: Auto Update Best Cloudflare IPs
+
+on:
+  schedule:
+    # 每 6 小时自动运行一次 (可根据需要修改 Cron 表达式)
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # 支持在 GitHub 页面手动点击运行
+
+jobs:
+  update-ips:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 赋予提交代码和发布 Release 的权限
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Cloudflare Speed Test
+        run: |
+          # 下载最新的 CloudflareSpeedTest 工具
+          wget https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/CloudflareSpeedTest_linux_amd64.tar.gz
+          tar -zxf CloudflareSpeedTest_linux_amd64.tar.gz
+          chmod +x CloudflareST
+
+      - name: Run Speed Test
+        run: |
+          # 运行测速，筛选前 20 个延迟最低、速度较快的 IPv4 并输出至 best-cf-ipv4.txt
+          ./CloudflareST -o result.csv -p 20 -tl 250 -dn 5
+          awk -F',' 'NR>1 {print $1}' result.csv > best-cf-ipv4.txt
+
+      - name: Commit and Push Updated File
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add best-cf-ipv4.txt
+          if git diff --staged --quiet; then
+            echo "No changes in IP list."
+          else
+            git commit -m "auto: update best-cf-ipv4.txt [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+            git push
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ github.run_number }}"
+          name: "Auto Updated IPs (${{ format('{0}', github.event.head_commit.timestamp || 'Latest') }})"
+          body: "Automatically generated list of best Cloudflare IPv4 addresses."
+          files: |
+            best-cf-ipv4.txt
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
