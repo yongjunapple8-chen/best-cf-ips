@@ -26,25 +26,26 @@ jobs:
           echo "Downloading from: $DOWNLOAD_URL"
           wget -q -O CloudflareSpeedTest_linux_amd64.tar.gz "$DOWNLOAD_URL"
           
-          # 解压并查看解压出的文件名
+          # 解压文件
           tar -zxf CloudflareSpeedTest_linux_amd64.tar.gz
-          ls -la
 
-          # 赋予所有可执行权限
-          chmod +x CloudflareST* 2>/dev/null || chmod +x cfst* 2>/dev/null || chmod +x *
+          # 递归查找二进制可执行文件并赋予权限
+          find . -type f \( -name "CloudflareST" -o -name "cfst" -o -name "*speedtest*" \) -exec chmod +x {} +
 
       - name: Run Speed Test
         run: |
-          # 自动寻找解压出的测速可执行程序运行
-          EXEC_FILE=$(ls | grep -E '^(CloudflareST|cfst)' | head -n 1)
-          if [ -z "$EXEC_FILE" ]; then
-            # 如果没匹配到，退而求其次寻找除了压缩包外的可执行文件
-            EXEC_FILE=$(find . -maxdepth 1 -type f -executable ! -name "*.tar.gz" ! -name "*.sh" | head -n 1)
+          # 递归寻找真正的二进制文件（排除文件夹和压缩包）
+          EXEC_PATH=$(find . -type f \( -name "CloudflareST" -o -name "cfst" \) | head -n 1)
+
+          if [ -z "$EXEC_PATH" ]; then
+            # 备用方案：寻找任何不在 .git 目录下的可执行文件
+            EXEC_PATH=$(find . -maxdepth 2 -type f -executable ! -path "*/.git/*" ! -name "*.tar.gz" ! -name "*.sh" | head -n 1)
           fi
 
-          echo "Executing: $EXEC_FILE"
-          ./"$EXEC_FILE" -o result.csv -p 20 -tl 250 -dn 5
+          echo "Executing binary at: $EXEC_PATH"
+          "$EXEC_PATH" -o result.csv -p 20 -tl 250 -dn 5
           awk -F',' 'NR>1 {print $1}' result.csv > best-cf-ipv4.txt
+          
       - name: Commit and Push Updated File
         run: |
           git config --global user.name "github-actions[bot]"
