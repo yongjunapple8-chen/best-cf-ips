@@ -2,15 +2,15 @@ name: Auto Update Best Cloudflare IPs
 
 on:
   schedule:
-    # 每 6 小时自动运行一次 (可根据需要修改 Cron 表达式)
+    # 每 6 小时自动运行一次
     - cron: '0 */6 * * *'
-  workflow_dispatch: # 支持在 GitHub 页面手动点击运行
+  workflow_dispatch: # 支持手动点击触发
 
 jobs:
   update-ips:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 赋予提交代码和发布 Release 的权限
+      contents: write # 赋予提交和 Release 发布权限
 
     steps:
       - name: Checkout repository
@@ -18,6 +18,7 @@ jobs:
 
       - name: Set up Cloudflare Speed Test
         run: |
+          # 动态获取最新 Release 下载链接
           DOWNLOAD_URL=$(curl -s https://api.github.com/repos/XIU2/CloudflareSpeedTest/releases/latest \
             | grep "browser_download_url.*linux_amd64.tar.gz" \
             | cut -d : -f 2,3 \
@@ -26,26 +27,25 @@ jobs:
           echo "Downloading from: $DOWNLOAD_URL"
           wget -q -O CloudflareSpeedTest_linux_amd64.tar.gz "$DOWNLOAD_URL"
           
-          # 解压文件
+          # 解压文件并递归赋予执行权限
           tar -zxf CloudflareSpeedTest_linux_amd64.tar.gz
-
-          # 递归查找二进制可执行文件并赋予权限
-          find . -type f \( -name "CloudflareST" -o -name "cfst" -o -name "*speedtest*" \) -exec chmod +x {} +
+          find . -type f \( -name "CloudflareST" -o -name "cfst" \) -exec chmod +x {} +
 
       - name: Run Speed Test
         run: |
-          # 递归寻找真正的二进制文件（排除文件夹和压缩包）
+          # 定位程序路径与所在目录
           EXEC_PATH=$(find . -type f \( -name "CloudflareST" -o -name "cfst" \) | head -n 1)
+          EXEC_DIR=$(dirname "$EXEC_PATH")
 
-          if [ -z "$EXEC_PATH" ]; then
-            # 备用方案：寻找任何不在 .git 目录下的可执行文件
-            EXEC_PATH=$(find . -maxdepth 2 -type f -executable ! -path "*/.git/*" ! -name "*.tar.gz" ! -name "*.sh" | head -n 1)
-          fi
+          echo "Running in directory: $EXEC_DIR"
 
-          echo "Executing binary at: $EXEC_PATH"
-          "$EXEC_PATH" -o result.csv -p 20 -tl 250 -dn 5
-          awk -F',' 'NR>1 {print $1}' result.csv > best-cf-ipv4.txt
-          
+          # 切换进程序目录运行，确保能正常读取同目录下的 ip.txt
+          cd "$EXEC_DIR"
+          ./$(basename "$EXEC_PATH") -o result.csv -p 20 -tl 250 -dn 5
+
+          # 提取最优 IP 并导出至仓库根目录
+          awk -F',' 'NR>1 {print $1}' result.csv > "$GITHUB_WORKSPACE/best-cf-ipv4.txt"
+
       - name: Commit and Push Updated File
         run: |
           git config --global user.name "github-actions[bot]"
