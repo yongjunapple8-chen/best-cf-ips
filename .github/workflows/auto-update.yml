@@ -23,9 +23,14 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests urllib3
+          pip install requests urllib3 geoip2
 
-      - name: Step 1 - Collect Candidate IPs
+      - name: Download Offline GeoIP Database
+        run: |
+          echo "Downloading offline GeoLite2 Country database..."
+          wget -q -O GeoLite2-Country.mmdb https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb
+
+      - name: Step 1 - Collect Candidate IPs with Asia Focus
         run: |
           python3 -c '
           import re
@@ -33,9 +38,11 @@ jobs:
           import random
           import ipaddress
 
+          # 增加亚太专项优选 IP 列表源
           SOURCES = [
               "https://raw.githubusercontent.com/LancelotRar/best-cf-ips/main/best-cf-ipv4.txt",
               "https://raw.githubusercontent.com/vfarid/cf-ip-scanner/main/ipv4.txt",
+              "https://raw.githubusercontent.com/cmliu/CFip-Merge/main/ip.txt",
               "https://www.cloudflare.com/ips-v4"
           ]
 
@@ -63,13 +70,13 @@ jobs:
                   print(f"Failed to fetch {url}: {e}")
 
           candidate_ips = list(ip_set)
-          if len(candidate_ips) > 1200:
-              candidate_ips = random.sample(candidate_ips, 1200)
+          if len(candidate_ips) > 2000:
+              candidate_ips = random.sample(candidate_ips, 2000)
 
           with open("ip.txt", "w", encoding="utf-8") as f:
               f.write("\n".join(candidate_ips) + "\n")
 
-          print(f"Step 1 Complete: Collected {len(candidate_ips)} IPs.")
+          print(f"Step 1 Complete: Collected {len(candidate_ips)} unique IPs.")
           '
 
       - name: Set up Cloudflare Speed Test
@@ -91,7 +98,7 @@ jobs:
           cp ip.txt "$EXEC_DIR/ip.txt"
           cd "$EXEC_DIR"
 
-          ./$(basename "$EXEC_PATH") -f ip.txt -o result.csv -p 0 -dn 5 -dt 3 -url https://cf.trackerslist.com/100MB.bin || true
+          ./$(basename "$EXEC_PATH") -f ip.txt -o result.csv -p 0 -dn 4 -dt 3 -url https://cf.trackerslist.com/100MB.bin || true
 
           if [ -f result.csv ]; then
             awk -F',' 'NR>1 {print $1","$5","$6}' result.csv > "$GITHUB_WORKSPACE/result_parsed.csv"
@@ -103,96 +110,110 @@ jobs:
             awk -F',' 'NR>1 {print $1","$5",0.00"}' result.csv > "$GITHUB_WORKSPACE/result_parsed.csv"
           fi
 
-      - name: Step 3 - Match Cloudflare Edge Colo Locations & Output
+      - name: Step 3 - GeoIP & Hybrid Location Match (Top 20 per region)
         run: |
           python3 -c '
           import os
+          import geoip2.database
           import urllib.request
           import concurrent.futures
           from collections import defaultdict
 
-          # 映射 Cloudflare 三字机场代码 (Colo) 到目标地区
+          TARGET_REGIONS = {"TW", "SG", "JP", "MY"}
+          FLAG_MAP = {"TW": "🇹🇼", "SG": "🇸🇬", "JP": "🇯🇵", "MY": "🇲🇾"}
           COLO_TO_REGION = {
-              # 台湾 (TW)
               "TPE": "TW", "KHH": "TW",
-              # 新加坡 (SG)
               "SIN": "SG",
-              # 日本 (JP)
               "NRT": "JP", "HND": "JP", "KIX": "JP", "FUK": "JP", "OKA": "JP",
-              # 马来西亚 (MY)
               "KUL": "MY", "PEN": "MY"
           }
 
-          FLAG_MAP = {"TW": "🇹🇼", "SG": "🇸🇬", "JP": "🇯🇵", "MY": "🇲🇾"}
-
           parsed_csv = "result_parsed.csv"
           if not os.path.exists(parsed_csv) or os.path.getsize(parsed_csv) == 0:
-              print("Error: No test results.")
+              print("Error: No test results found.")
               exit(1)
 
-          tested_ips = []
+          tested_ips = {}
           with open(parsed_csv, "r", encoding="utf-8") as f:
               for line in f:
                   parts = line.strip().split(",")
                   if len(parts) == 3:
                       try:
-                          tested_ips.append((parts[0], float(parts[1]), float(parts[2])))
+                          ip, delay, speed = parts[0], float(parts[1]), float(parts[2])
+                          tested_ips[ip] = (delay, speed)
                       except ValueError:
                           pass
 
-          # 截取前 400 个性能最好的 IP 进行 HTTP 节点识别
-          tested_ips = sorted(tested_ips, key=lambda x: (-x[2], x[1]))[:400]
-          print(f"Probing {len(tested_ips)} candidate IPs for Cloudflare Colo locations...")
+          print(f"Total speed-tested IPs: {len(tested_ips)}")
 
-          def get_ip_colo(ip):
-              url = f"http://{ip}/cdn-cgi/trace"
-              req = urllib.request.Request(url, headers={"Host": "1.1.1.1", "User-Agent": "Mozilla/5.0"})
-              try:
-                  with urllib.request.urlopen(req, timeout=2.5) as resp:
-                      lines = resp.read().decode("utf-8", errors="ignore").splitlines()
-                      for line in lines:
-                          if line.startswith("colo="):
-                              return ip, line.split("=")[1].strip()
-              except Exception:
-                  pass
-              return ip, None
-
-          ip_to_region = {}
-          with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-              futures = [executor.submit(get_ip_colo, item[0]) for item in tested_ips]
-              for future in concurrent.futures.as_completed(futures):
-                  ip, colo = future.result()
-                  if colo and colo in COLO_TO_REGION:
-                      ip_to_region[ip] = COLO_TO_REGION[colo]
-
+          # 1. 优先使用 GeoIP 本地库进行物理定位
           region_grouped = defaultdict(list)
-          for ip, delay, speed in tested_ips:
-              if ip in ip_to_region:
-                  region = ip_to_region[ip]
-                  region_grouped[region].append((ip, delay, speed))
+          unmatched_ips = []
 
+          db_path = "GeoLite2-Country.mmdb"
+          with geoip2.database.Reader(db_path) as reader:
+              for ip, (delay, speed) in tested_ips.items():
+                  try:
+                      res = reader.country(ip)
+                      code = res.country.iso_code
+                  except Exception:
+                      code = "UNK"
+
+                  if code in TARGET_REGIONS:
+                      region_grouped[code].append((ip, delay, speed))
+                  else:
+                      unmatched_ips.append((ip, delay, speed))
+
+          # 2. 如果 GeoIP 未能找满目标地区，对未匹配的 Top 300 IP 补充 HTTP Colo 探测
+          if unmatched_ips:
+              top_unmatched = sorted(unmatched_ips, key=lambda x: (-x[2], x[1]))[:300]
+              
+              def check_colo(item):
+                  ip, delay, speed = item
+                  url = f"http://{ip}/cdn-cgi/trace"
+                  req = urllib.request.Request(url, headers={"Host": "1.1.1.1", "User-Agent": "Mozilla/5.0"})
+                  try:
+                      with urllib.request.urlopen(req, timeout=2.0) as resp:
+                          for line in resp.read().decode("utf-8", errors="ignore").splitlines():
+                              if line.startswith("colo="):
+                                  colo = line.split("=")[1].strip()
+                                  if colo in COLO_TO_REGION:
+                                      return ip, delay, speed, COLO_TO_REGION[colo]
+                  except Exception:
+                      pass
+                  return ip, delay, speed, None
+
+              with concurrent.futures.ThreadPoolExecutor(max_workers=40) as executor:
+                  results = executor.map(check_colo, top_unmatched)
+                  for ip, delay, speed, region in results:
+                      if region:
+                          region_grouped[region].append((ip, delay, speed))
+
+          # 3. 输出格式化的各地区数据
           output_lines = []
           for region in ["TW", "SG", "JP", "MY"]:
-              if region in region_grouped:
-                  sorted_list = sorted(region_grouped[region], key=lambda x: (-x[2], x[1]))[:20]
+              if region in region_grouped and region_grouped[region]:
+                  # 去重并排序
+                  unique_dict = {x[0]: x for x in region_grouped[region]}
+                  sorted_list = sorted(unique_dict.values(), key=lambda x: (-x[2], x[1]))[:20]
+                  
                   flag = FLAG_MAP.get(region, "🌐")
                   for ip, delay, speed in sorted_list:
                       output_lines.append(f"{ip}:443#{region} {flag}")
-                  print(f"Region {region}: Extracted {len(sorted_list)} real edge IPs.")
+                  print(f"Region {region}: Extracted {len(sorted_list)} valid IPs.")
 
           if not output_lines:
-              print("Warning: No matching target regions found from probed IPs. Outputting top overall IPs as fallback.")
-              for ip, delay, speed in tested_ips[:40]:
-                  output_lines.append(f"{ip}:443#CF 🌐")
+              print("Error: Could not match any IP to target regions.")
+              exit(1)
 
           with open("best-cf-ipv4.txt", "w", encoding="utf-8") as f:
               f.write("\n".join(output_lines) + "\n")
 
-          print(f"Successfully generated best-cf-ipv4.txt with {len(output_lines)} IPs.")
+          print(f"Successfully updated best-cf-ipv4.txt with {len(output_lines)} IPs.")
           '
 
       - name: Clean Temporary Files
-        run: rm -f ip.txt result_parsed.csv
+        run: rm -f ip.txt result_parsed.csv GeoLite2-Country.mmdb
 
       - name: Commit and Push Updated File
         run: |
@@ -203,7 +224,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes in IP list."
           else
-            git commit -m "auto: update best-cf-ipv4.txt [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+            git commit -m "auto: update best-cf-ipv4.txt (TW/SG/JP/MY Top 20) [$(date -u +'%Y-%m-%d %H:%M UTC')]"
             git push
           fi
 
@@ -212,7 +233,7 @@ jobs:
         with:
           tag_name: "v${{ github.run_number }}"
           name: "Auto Updated IPs (${{ format('{0}', github.event.head_commit.timestamp || 'Latest') }})"
-          body: "Automatically generated list of Cloudflare IPv4 addresses mapped via Cloudflare Edge Colo trace."
+          body: "Automatically generated list of Cloudflare IPv4 addresses targeting TW, SG, JP, MY."
           files: |
             best-cf-ipv4.txt
           draft: false
