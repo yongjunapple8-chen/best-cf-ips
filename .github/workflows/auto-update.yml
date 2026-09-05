@@ -24,7 +24,12 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests urllib3
+          pip install requests urllib3 geoip2
+
+      - name: Download Offline GeoIP Database
+        run: |
+          echo "Downloading offline GeoLite2 Country database..."
+          wget -q -O GeoLite2-Country.mmdb https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb
 
       - name: Set up Cloudflare Speed Test
         run: |
@@ -60,22 +65,20 @@ jobs:
         run: |
           python - << 'EOF'
           import re
-          import requests
           import urllib.request
           import os
-          import time
           import random
           import ipaddress
+          import geoip2.database
           from collections import defaultdict
 
           # 指定目标收集国家/地区 (TW: 台湾, SG: 新加坡, JP: 日本, MY: 马来西亚)
           TARGET_REGIONS = {"TW", "SG", "JP", "MY"}
 
-          # 聚合源配置：公开/开源优选 IP 列表及 Cloudflare 官方 IPv4 段
+          # 聚合源配置：有效开源优选 IP 列表及 Cloudflare 官方 IPv4 段
           SOURCES = [
               "https://raw.githubusercontent.com/LancelotRar/best-cf-ips/main/best-cf-ipv4.txt",
-              "https://raw.githubusercontent.com/ip-finder/cloudflare-clean-ip/main/ip.txt",
-              "https://raw.githubusercontent.com/ymyuuu/IPDB/main/cloudflare/ipv4.txt",
+              "https://raw.githubusercontent.com/vfarid/cf-ip-scanner/main/ipv4.txt",
               "https://www.cloudflare.com/ips-v4"  # Cloudflare 官方 IP 段 (CIDR 格式)
           ]
 
@@ -84,48 +87,6 @@ jobs:
               if not country_code or len(country_code) != 2:
                   return "🌐"
               return chr(ord(country_code[0].upper()) + 127397) + chr(ord(country_code[1].upper()) + 127397)
-
-          # 带有重试和防频控机制的 GeoIP 查询
-          def batch_geoip_lookup(ip_list):
-              results = {}
-              chunk_size = 50  # 减小单批次数量，降低被断开连接的风险
-              headers = {
-                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-              }
-
-              for i in range(0, len(ip_list), chunk_size):
-                  chunk = ip_list[i:i + chunk_size]
-                  success = False
-                  
-                  # 针对每个 chunk 最多尝试 3 次
-                  for attempt in range(3):
-                      try:
-                          # 改用 HTTPS 协议
-                          resp = requests.post(
-                              "https://ip-api.com/batch?fields=query,countryCode", 
-                              json=chunk, 
-                              headers=headers,
-                              timeout=15
-                          )
-                          if resp.status_code == 200:
-                              for item in resp.json():
-                                  results[item.get("query")] = item.get("countryCode", "UNK")
-                              success = True
-                              break
-                          elif resp.status_code == 429:
-                              print(f"GeoIP Rate limited (429), backing off for 5s (attempt {attempt+1})...")
-                              time.sleep(5)
-                      except Exception as e:
-                          print(f"GeoIP query warning (attempt {attempt+1}): {e}")
-                          time.sleep(2)
-
-                  if not success:
-                      print(f"Failed to query GeoIP for batch starting at index {i}")
-
-                  # 每次请求后主动休眠 1 秒，防止触发 API 速率限制
-                  time.sleep(1.0)
-
-              return results
 
           def main():
               ip_delay_map = {}
@@ -158,13 +119,13 @@ jobs:
                               if ip not in ip_delay_map:
                                   ip_delay_map[ip] = 999.0
 
-                          # 提取 CIDR 网段（如 Cloudflare 官方列表），每个网段随机采样 10 个 IP
+                          # 提取 CIDR 网段（如 Cloudflare 官方列表），每个网段随机采样 15 个 IP
                           cidrs = cidr_pattern.findall(content)
                           for cidr in cidrs:
                               try:
                                   net = ipaddress.ip_network(cidr, strict=False)
                                   hosts = list(net.hosts())
-                                  sample_size = min(10, len(hosts))
+                                  sample_size = min(15, len(hosts))
                                   sampled_ips = [str(ip) for ip in random.sample(hosts, sample_size)]
                                   for ip in sampled_ips:
                                       if ip not in ip_delay_map:
@@ -181,21 +142,25 @@ jobs:
               all_ips = list(ip_delay_map.keys())
               print(f"Total unique IPs collected (including CIDR sampling): {len(all_ips)}")
 
-              # 限制单次排查上限为 4000 个，防止 API 触发高额滥用封禁
-              if len(all_ips) > 4000:
-                  print("Limiting IP check pool to 4000 random samples to avoid rate-limit bans.")
-                  all_ips = random.sample(all_ips, 4000)
-
-              # 3. 批量查询 GeoIP 国家信息
-              geoip_map = batch_geoip_lookup(all_ips)
-
-              # 4. 筛选并按目标地区分组（仅保留 TW, SG, JP, MY）
+              # 3. 使用本地 GeoIP 数据库毫秒级匹配国家/地区
               region_grouped = defaultdict(list)
-              for ip in all_ips:
-                  country_code = geoip_map.get(ip, "UNK")
-                  if country_code in TARGET_REGIONS:
-                      delay = ip_delay_map.get(ip, 999.0)
-                      region_grouped[country_code].append((ip, delay))
+              db_path = "GeoLite2-Country.mmdb"
+
+              if not os.path.exists(db_path):
+                  print(f"Error: GeoIP database file '{db_path}' not found.")
+                  exit(1)
+
+              with geoip2.database.Reader(db_path) as reader:
+                  for ip in all_ips:
+                      try:
+                          response = reader.country(ip)
+                          country_code = response.country.iso_code
+                      except Exception:
+                          country_code = "UNK"
+
+                      if country_code in TARGET_REGIONS:
+                          delay = ip_delay_map.get(ip, 999.0)
+                          region_grouped[country_code].append((ip, delay))
 
               output_lines = []
               
@@ -212,7 +177,7 @@ jobs:
                           output_lines.append(f"{ip}:443#{country_code} {flag}")
                       print(f"Region {country_code}: Retained {len(top20_ips)} IPs")
 
-              # 5. 安全保护：如果没筛选出任何有效 IP，终止写入，防止空覆盖
+              # 4. 安全保护：如果没筛选出任何有效 IP，终止写入，防止空覆盖
               if not output_lines:
                   print("Error: No IPs matched target regions. Aborting file write to prevent empty output.")
                   exit(1)
@@ -228,7 +193,7 @@ jobs:
           EOF
 
       - name: Clean Temporary Files
-        run: rm -f result_parsed.csv
+        run: rm -f result_parsed.csv GeoLite2-Country.mmdb
 
       - name: Commit and Push Updated File
         run: |
