@@ -24,7 +24,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests urllib3
 
       - name: Set up Cloudflare Speed Test
         run: |
@@ -51,7 +51,7 @@ jobs:
 
           # 切换进程序目录运行，测出更多 IP 供后续筛选（-p 200）
           cd "$EXEC_DIR"
-          ./$(basename "$EXEC_PATH") -o result.csv -p 200 -tl 300 -dn 5
+          ./$(basename "$EXEC_PATH") -o result.csv -p 200 -tl 400 -dn 5
 
           # 提取当前测速的 IP 和延迟数据保存至 result_parsed.csv
           awk -F',' 'NR>1 {print $1","$5}' result.csv > "$GITHUB_WORKSPACE/result_parsed.csv"
@@ -63,6 +63,7 @@ jobs:
           import requests
           import urllib.request
           import os
+          import time
           from collections import defaultdict
 
           # 指定目标收集国家/地区 (TW: 台湾, SG: 新加坡, JP: 日本, MY: 马来西亚)
@@ -71,8 +72,6 @@ jobs:
           # 聚合源配置：公开/开源优选 IP 列表 Raw URL
           SOURCES = [
               "https://raw.githubusercontent.com/LancelotRar/best-cf-ips/main/best-cf-ipv4.txt",
-              # 可根据需要解除注释或添加更多公开源
-              # "https://raw.githubusercontent.com/31b9/Cloudflare-IPSpeedTest/main/best-cf-ipv4.txt",
           ]
 
           # 将 ISO 国家代码转换为对应的国旗 Emoji
@@ -81,19 +80,46 @@ jobs:
                   return "🌐"
               return chr(ord(country_code[0].upper()) + 127397) + chr(ord(country_code[1].upper()) + 127397)
 
-          # 批量查询 IP 地理位置信息
+          # 带有重试和防频控机制的 GeoIP 查询
           def batch_geoip_lookup(ip_list):
               results = {}
-              chunk_size = 100
+              chunk_size = 50  # 减小单批次数量，降低被断开连接的风险
+              headers = {
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+              }
+
               for i in range(0, len(ip_list), chunk_size):
                   chunk = ip_list[i:i + chunk_size]
-                  try:
-                      resp = requests.post("http://ip-api.com/batch?fields=query,countryCode", json=chunk, timeout=10)
-                      if resp.status_code == 200:
-                          for item in resp.json():
-                              results[item.get("query")] = item.get("countryCode", "UNK")
-                  except Exception as e:
-                      print(f"GeoIP query failed: {e}")
+                  success = False
+                  
+                  # 针对每个 chunk 最多尝试 3 次
+                  for attempt in range(3):
+                      try:
+                          # 改用 HTTPS 协议
+                          resp = requests.post(
+                              "https://ip-api.com/batch?fields=query,countryCode", 
+                              json=chunk, 
+                              headers=headers,
+                              timeout=15
+                          )
+                          if resp.status_code == 200:
+                              for item in resp.json():
+                                  results[item.get("query")] = item.get("countryCode", "UNK")
+                              success = True
+                              break
+                          elif resp.status_code == 429:
+                              print(f"GeoIP Rate limited (429), backing off for 5s (attempt {attempt+1})...")
+                              time.sleep(5)
+                      except Exception as e:
+                          print(f"GeoIP query warning (attempt {attempt+1}): {e}")
+                          time.sleep(2)
+
+                  if not success:
+                      print(f"Failed to query GeoIP for batch starting at index {i}")
+
+                  # 每次请求后主动休眠 1 秒，防止触发 API 速率限制
+                  time.sleep(1.0)
+
               return results
 
           def main():
@@ -159,11 +185,16 @@ jobs:
                           output_lines.append(f"{ip}:443#{country_code} {flag}")
                       print(f"Region {country_code}: Retained {len(top20_ips)} IPs")
 
+              # 5. 安全保护：如果没筛选出任何有效 IP，终止写入，防止空覆盖
+              if not output_lines:
+                  print("Error: No IPs matched target regions. Aborting file write to prevent empty output.")
+                  exit(1)
+
               # 写入 best-cf-ipv4.txt 文件
               with open("best-cf-ipv4.txt", "w", encoding="utf-8") as f:
                   f.write("\n".join(output_lines) + "\n")
 
-              print(f"Filtering complete. Generated best-cf-ipv4.txt with {len(output_lines)} total IPs.")
+              print(f"Filtering complete. Successfully generated best-cf-ipv4.txt with {len(output_lines)} total IPs.")
 
           if __name__ == "__main__":
               main()
