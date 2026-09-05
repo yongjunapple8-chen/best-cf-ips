@@ -64,7 +64,7 @@ jobs:
                           try:
                               net = ipaddress.ip_network(cidr, strict=False)
                               hosts = list(net.hosts())
-                              sample_size = min(20, len(hosts))
+                              sample_size = min(15, len(hosts))
                               sampled_ips = [str(ip) for ip in random.sample(hosts, sample_size)]
                               for ip in sampled_ips:
                                   ip_set.add(ip)
@@ -74,9 +74,9 @@ jobs:
                   print(f"Failed to fetch {url}: {e}")
 
           candidate_ips = list(ip_set)
-          if len(candidate_ips) > 2000:
-              print(f"Sampling 2000 candidate IPs from {len(candidate_ips)} total collected.")
-              candidate_ips = random.sample(candidate_ips, 2000)
+          if len(candidate_ips) > 1500:
+              print(f"Sampling 1500 candidate IPs from {len(candidate_ips)} total collected.")
+              candidate_ips = random.sample(candidate_ips, 1500)
 
           with open("ip.txt", "w", encoding="utf-8") as f:
               f.write("\n".join(candidate_ips) + "\n")
@@ -97,7 +97,7 @@ jobs:
           tar -zxf CloudflareSpeedTest_linux_amd64.tar.gz
           find . -type f \( -name "CloudflareST" -o -name "cfst" \) -exec chmod +x {} +
 
-      - name: Step 2 - Run Full HTTP Download Speed Test on Candidates
+      - name: Step 2 - Run Speed Test on Candidates
         run: |
           EXEC_PATH=$(find . -type f \( -name "CloudflareST" -o -name "cfst" \) | head -n 1)
           EXEC_DIR=$(dirname "$EXEC_PATH")
@@ -105,9 +105,20 @@ jobs:
           cp ip.txt "$EXEC_DIR/ip.txt"
           cd "$EXEC_DIR"
 
-          ./$(basename "$EXEC_PATH") -f ip.txt -o result.csv -p 0 -dn 10 -dt 3 -tl 400
+          # 尝试以 4 线程下载测速
+          ./$(basename "$EXEC_PATH") -f ip.txt -o result.csv -p 0 -dn 4 -dt 3 -url https://cf.trackerslist.com/100MB.bin || true
 
-          awk -F',' 'NR>1 && $6>0 {print $1","$5","$6}' result.csv > "$GITHUB_WORKSPACE/result_parsed.csv"
+          # 提取数据：$1=IP, $5=延迟(ms), $6=下载速度(MB/s)
+          if [ -f result.csv ]; then
+            awk -F',' 'NR>1 {print $1","$5","$6}' result.csv > "$GITHUB_WORKSPACE/result_parsed.csv"
+          fi
+
+          # 兜底机制：如果没测出有下载速度的数据，重新跑一次快速延迟/连通性测试（-dn 0）
+          if [ ! -s "$GITHUB_WORKSPACE/result_parsed.csv" ]; then
+            echo "Download speed test failed or returned 0 items. Falling back to Ping latency mode..."
+            ./$(basename "$EXEC_PATH") -f ip.txt -o result.csv -p 0 -dn 0
+            awk -F',' 'NR>1 {print $1","$5",0.00"}' result.csv > "$GITHUB_WORKSPACE/result_parsed.csv"
+          fi
 
       - name: Step 3 - GeoIP Match, Filter Target Regions & Output
         run: |
@@ -125,7 +136,7 @@ jobs:
 
           parsed_csv = "result_parsed.csv"
           if not os.path.exists(parsed_csv) or os.path.getsize(parsed_csv) == 0:
-              print("Error: Speed test produced no valid results.")
+              print("Error: Speed test produced no valid results at all.")
               exit(1)
 
           tested_ips = {}
@@ -162,13 +173,14 @@ jobs:
           
           for country_code in ["TW", "SG", "JP", "MY"]:
               if country_code in region_grouped:
+                  # 优先看速度(大到小)，速度相同看延迟(小到大)
                   sorted_ips = sorted(region_grouped[country_code], key=lambda x: (-x[2], x[1]))
                   top20_ips = sorted_ips[:20]
                   
                   flag = get_flag_emoji(country_code)
                   for ip, delay, speed in top20_ips:
                       output_lines.append(f"{ip}:443#{country_code} {flag}")
-                  print(f"Region {country_code}: Selected Top {len(top20_ips)} IPs (Max Speed: {top20_ips[0][2]} MB/s)")
+                  print(f"Region {country_code}: Selected Top {len(top20_ips)} IPs (Max Speed: {top20_ips[0][2]} MB/s, Latency: {top20_ips[0][1]} ms)")
 
           if not output_lines:
               print("Error: No tested IPs matched target regions. Aborting write.")
