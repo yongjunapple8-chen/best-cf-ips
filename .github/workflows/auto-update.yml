@@ -129,11 +129,23 @@ jobs:
           import concurrent.futures
           from collections import defaultdict
 
-          FLAG_MAP = {"TW": "🇹🇼", "SG": "🇸🇬", "JP": "🇯🇵", "MY": "🇲🇾"}
+          # 追加 KR(韩国) 与 AU(澳大利亚) 的国旗
+          FLAG_MAP = {
+              "TW": "🇹🇼",
+              "SG": "🇸🇬",
+              "JP": "🇯🇵",
+              "KR": "🇰🇷",
+              "AU": "🇦🇺",
+              "MY": "🇲🇾"
+          }
+
+          # 追加韩国 (ICN, GMP, PUS) 与 澳大利亚 (SYD, MEL, BNE, PER, ADL) 的机房代号
           COLO_TO_REGION = {
               "TPE": "TW", "KHH": "TW",
               "SIN": "SG",
               "NRT": "JP", "HND": "JP", "KIX": "JP", "FUK": "JP", "OKA": "JP",
+              "ICN": "KR", "GMP": "KR", "PUS": "KR",
+              "SYD": "AU", "MEL": "AU", "BNE": "AU", "PER": "AU", "ADL": "AU",
               "KUL": "MY", "PEN": "MY"
           }
 
@@ -179,7 +191,8 @@ jobs:
                       region_grouped[region].append((ip, delay, speed))
 
           output_lines = []
-          target_regions = ["TW", "SG", "JP", "MY"]
+          # 目标地区加入了 KR 和 AU
+          target_regions = ["TW", "SG", "JP", "KR", "AU", "MY"]
           
           assigned_ips = set()
           for r in target_regions:
