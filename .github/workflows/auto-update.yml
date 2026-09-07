@@ -25,7 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests urllib3
 
-      - name: Step 1 - Collect Candidate IPs with Asia Subnets
+      - name: Step 1 - Collect Candidate IPs with Global Subnets
         run: |
           python3 -c '
           import re
@@ -40,11 +40,17 @@ jobs:
               "https://www.cloudflare.com/ips-v4"
           ]
 
-          ASIA_CIDRS = [
+          # 包含 亚洲、北美(US)、欧洲(DE) 常用 Cloudflare 网段
+          TARGET_CIDRS = [
+              # 亚洲 & 通用段
               "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13",
               "162.158.0.0/15", "198.41.128.0/17", "108.162.192.0/18",
               "141.101.64.0/18", "173.245.48.0/20", "103.21.244.0/22",
-              "103.22.200.0/22", "103.31.4.0/22", "188.114.96.0/20"
+              "103.22.200.0/22", "103.31.4.0/22", "188.114.96.0/20",
+              # 北美 (US)
+              "104.16.0.0/12", "172.64.0.0/12", "108.162.192.0/18",
+              # 欧洲 (DE)
+              "188.114.96.0/20", "162.158.0.0/15"
           ]
 
           ip_set = set()
@@ -70,7 +76,7 @@ jobs:
               except Exception as e:
                   print(f"Failed to fetch {url}: {e}")
 
-          for cidr in ASIA_CIDRS:
+          for cidr in TARGET_CIDRS:
               try:
                   net = ipaddress.ip_network(cidr, strict=False)
                   hosts = list(net.hosts())
@@ -81,8 +87,8 @@ jobs:
                   pass
 
           candidate_ips = list(ip_set)
-          if len(candidate_ips) > 2500:
-              candidate_ips = random.sample(candidate_ips, 2500)
+          if len(candidate_ips) > 3000:
+              candidate_ips = random.sample(candidate_ips, 3000)
 
           with open("ip.txt", "w", encoding="utf-8") as f:
               f.write("\n".join(candidate_ips) + "\n")
@@ -129,24 +135,36 @@ jobs:
           import concurrent.futures
           from collections import defaultdict
 
-          # 追加 KR(韩国) 与 AU(澳大利亚) 的国旗
+          # 追加 US(美国) 与 DE(德国) 的国旗
           FLAG_MAP = {
               "TW": "🇹🇼",
               "SG": "🇸🇬",
               "JP": "🇯🇵",
               "KR": "🇰🇷",
               "AU": "🇦🇺",
-              "MY": "🇲🇾"
+              "MY": "🇲🇾",
+              "US": "🇺🇸",
+              "DE": "🇩🇪"
           }
 
-          # 追加韩国 (ICN, GMP, PUS) 与 澳大利亚 (SYD, MEL, BNE, PER, ADL) 的机房代号
+          # 追加美国与德国的主要 Cloudflare 数据中心代号 (Colo)
           COLO_TO_REGION = {
+              # 亚洲 & 大洋洲
               "TPE": "TW", "KHH": "TW",
               "SIN": "SG",
               "NRT": "JP", "HND": "JP", "KIX": "JP", "FUK": "JP", "OKA": "JP",
               "ICN": "KR", "GMP": "KR", "PUS": "KR",
               "SYD": "AU", "MEL": "AU", "BNE": "AU", "PER": "AU", "ADL": "AU",
-              "KUL": "MY", "PEN": "MY"
+              "KUL": "MY", "PEN": "MY",
+              
+              # 美国 (US) 主要节点
+              "SJC": "US", "LAX": "US", "SEA": "US", "SFO": "US", "PDX": "US", 
+              "ORD": "US", "JFK": "US", "EWR": "US", "IAD": "US", "ATL": "US", 
+              "DFW": "US", "IAH": "US", "MIA": "US", "DEN": "US", "PHX": "US", 
+              "LAS": "US", "SLC": "US", "DTW": "US", "MSP": "US", "CLT": "US",
+
+              # 德国 (DE) 主要节点
+              "FRA": "DE", "MUC": "DE", "BER": "DE", "STR": "DE", "HAM": "DE", "DUS": "DE"
           }
 
           parsed_csv = "result_parsed.csv"
@@ -168,7 +186,7 @@ jobs:
           print(f"Total speed tested IPs: {len(tested_ips)}")
 
           region_grouped = defaultdict(list)
-          top_probes = tested_ips[:600]
+          top_probes = tested_ips[:800]  # 适度增加探测数量以覆盖更多节点
 
           def get_colo(item):
               ip, delay, speed = item
@@ -191,8 +209,8 @@ jobs:
                       region_grouped[region].append((ip, delay, speed))
 
           output_lines = []
-          # 目标地区加入了 KR 和 AU
-          target_regions = ["TW", "SG", "JP", "KR", "AU", "MY"]
+          # 目标地区加入了 US 和 DE
+          target_regions = ["TW", "SG", "JP", "KR", "AU", "MY", "US", "DE"]
           
           assigned_ips = set()
           for r in target_regions:
