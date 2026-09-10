@@ -1,4 +1,4 @@
-name: Auto Update & Aggregate Best Cloudflare IPs
+name: Auto Update Best Cloudflare US IPs
 
 on:
   schedule:
@@ -23,9 +23,9 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests urllib3
+          pip install requests urllib3 aiohttp
 
-      - name: Step 1 - Collect Candidate IPs with Global Subnets
+      - name: Step 1 - Collect US Candidate IPs
         run: |
           python3 -c '
           import re
@@ -40,17 +40,14 @@ jobs:
               "https://www.cloudflare.com/ips-v4"
           ]
 
-          # 包含 亚洲、北美(US)、欧洲(DE) 常用 Cloudflare 网段
+          # 北美 (US) 常用及核心 Cloudflare 网段
           TARGET_CIDRS = [
-              # 亚洲 & 通用段
-              "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13",
-              "162.158.0.0/15", "198.41.128.0/17", "108.162.192.0/18",
-              "141.101.64.0/18", "173.245.48.0/20", "103.21.244.0/22",
-              "103.22.200.0/22", "103.31.4.0/22", "188.114.96.0/20",
-              # 北美 (US)
-              "104.16.0.0/12", "172.64.0.0/12", "108.162.192.0/18",
-              # 欧洲 (DE)
-              "188.114.96.0/20", "162.158.0.0/15"
+              "104.16.0.0/12", 
+              "172.64.0.0/12", 
+              "108.162.192.0/18",
+              "162.158.0.0/15",
+              "198.41.128.0/17",
+              "173.245.48.0/20"
           ]
 
           ip_set = set()
@@ -68,7 +65,7 @@ jobs:
                           try:
                               net = ipaddress.ip_network(cidr, strict=False)
                               hosts = list(net.hosts())
-                              sample_size = min(10, len(hosts))
+                              sample_size = min(15, len(hosts))
                               for ip in random.sample(hosts, sample_size):
                                   ip_set.add(str(ip))
                           except Exception:
@@ -80,15 +77,16 @@ jobs:
               try:
                   net = ipaddress.ip_network(cidr, strict=False)
                   hosts = list(net.hosts())
-                  sample_size = min(50, len(hosts))
+                  sample_size = min(200, len(hosts))
                   for ip in random.sample(hosts, sample_size):
                       ip_set.add(str(ip))
               except Exception:
                   pass
 
           candidate_ips = list(ip_set)
-          if len(candidate_ips) > 3000:
-              candidate_ips = random.sample(candidate_ips, 3000)
+          # 扩大候选池至 5000 个 IP，保证筛选基数
+          if len(candidate_ips) > 5000:
+              candidate_ips = random.sample(candidate_ips, 5000)
 
           with open("ip.txt", "w", encoding="utf-8") as f:
               f.write("\n".join(candidate_ips) + "\n")
@@ -107,7 +105,7 @@ jobs:
           tar -zxf CloudflareSpeedTest.tar.gz
           find . -type f \( -name "CloudflareST" -o -name "cfst" \) -exec chmod +x {} +
 
-      - name: Step 2 - Run Speed Test
+      - name: Step 2 - Run Speed Test (High Precision)
         run: |
           EXEC_PATH=$(find . -type f \( -name "CloudflareST" -o -name "cfst" \) | head -n 1)
           EXEC_DIR=$(dirname "$EXEC_PATH")
@@ -115,7 +113,22 @@ jobs:
           cp ip.txt "$EXEC_DIR/ip.txt"
           cd "$EXEC_DIR"
 
-          ./$(basename "$EXEC_PATH") -f ip.txt -o result.csv -p 0 -dn 5 -dt 3 -url https://cf.trackerslist.com/100MB.bin || true
+          # 高精度测速参数：
+          # -p 100: 达到 100 个满足标准的 IP 即停止
+          # -t 5: 延迟测试 5 次取平均值
+          # -dn 150: 筛选延迟前 150 的 IP 进行下载测试
+          # -dt 6: 测速时间 6 秒（克服 TCP 慢启动）
+          # -dtm 10: 限制单个 IP 测速线程数，防止频繁触发限流
+          # -url: 使用 Cloudflare 官方 100MB 测速节点
+          ./$(basename "$EXEC_PATH") \
+            -f ip.txt \
+            -o result.csv \
+            -p 100 \
+            -t 5 \
+            -dn 150 \
+            -dt 6 \
+            -dtm 10 \
+            -url https://speed.cloudflare.com/__down?bytes=100000000 || true
 
           if [ -f result.csv ]; then
             awk -F',' 'NR>1 {print $1","$5","$6}' result.csv > "$GITHUB_WORKSPACE/result_parsed.csv"
@@ -127,44 +140,18 @@ jobs:
             awk -F',' 'NR>1 {print $1","$5",0.00"}' result.csv > "$GITHUB_WORKSPACE/result_parsed.csv"
           fi
 
-      - name: Step 3 - Flexible Region Classification & Output
+      - name: Step 3 - Extract Top 100 US IPs (Async Fast Scan)
         run: |
           python3 -c '
           import os
-          import urllib.request
-          import concurrent.futures
-          from collections import defaultdict
+          import asyncio
+          import aiohttp
 
-          # 追加 US(美国) 与 DE(德国) 的国旗
-          FLAG_MAP = {
-              "TW": "🇹🇼",
-              "SG": "🇸🇬",
-              "JP": "🇯🇵",
-              "KR": "🇰🇷",
-              "AU": "🇦🇺",
-              "MY": "🇲🇾",
-              "US": "🇺🇸",
-              "DE": "🇩🇪"
-          }
-
-          # 追加美国与德国的主要 Cloudflare 数据中心代号 (Colo)
-          COLO_TO_REGION = {
-              # 亚洲 & 大洋洲
-              "TPE": "TW", "KHH": "TW",
-              "SIN": "SG",
-              "NRT": "JP", "HND": "JP", "KIX": "JP", "FUK": "JP", "OKA": "JP",
-              "ICN": "KR", "GMP": "KR", "PUS": "KR",
-              "SYD": "AU", "MEL": "AU", "BNE": "AU", "PER": "AU", "ADL": "AU",
-              "KUL": "MY", "PEN": "MY",
-              
-              # 美国 (US) 主要节点
-              "SJC": "US", "LAX": "US", "SEA": "US", "SFO": "US", "PDX": "US", 
-              "ORD": "US", "JFK": "US", "EWR": "US", "IAD": "US", "ATL": "US", 
-              "DFW": "US", "IAH": "US", "MIA": "US", "DEN": "US", "PHX": "US", 
-              "LAS": "US", "SLC": "US", "DTW": "US", "MSP": "US", "CLT": "US",
-
-              # 德国 (DE) 主要节点
-              "FRA": "DE", "MUC": "DE", "BER": "DE", "STR": "DE", "HAM": "DE", "DUS": "DE"
+          # 美国 (US) 主要 Cloudflare 数据中心代号 (Colo)
+          US_COLOS = {
+              "SJC", "LAX", "SEA", "SFO", "PDX", "ORD", "JFK", "EWR", 
+              "IAD", "ATL", "DFW", "IAH", "MIA", "DEN", "PHX", "LAS", 
+              "SLC", "DTW", "MSP", "CLT", "MEM", "BOS", "CLE", "IND"
           }
 
           parsed_csv = "result_parsed.csv"
@@ -178,66 +165,75 @@ jobs:
                   parts = line.strip().split(",")
                   if len(parts) == 3:
                       try:
+                          # 存储结构: (IP, 延迟, 下载速度)
                           tested_ips.append((parts[0], float(parts[1]), float(parts[2])))
                       except ValueError:
                           pass
 
+          # 优先按【下载速度降序】，速度相同时按【延迟升序】
           tested_ips = sorted(tested_ips, key=lambda x: (-x[2], x[1]))
           print(f"Total speed tested IPs: {len(tested_ips)}")
 
-          region_grouped = defaultdict(list)
-          top_probes = tested_ips[:800]  # 适度增加探测数量以覆盖更多节点
+          # 截取前 1500 个优质 IP 进行并发探测
+          top_probes = tested_ips[:1500]
 
-          def get_colo(item):
+          async def fetch_colo(session, semaphore, item):
               ip, delay, speed = item
               url = f"http://{ip}/cdn-cgi/trace"
-              req = urllib.request.Request(url, headers={"Host": "1.1.1.1", "User-Agent": "Mozilla/5.0"})
-              try:
-                  with urllib.request.urlopen(req, timeout=1.8) as resp:
-                      for line in resp.read().decode("utf-8", errors="ignore").splitlines():
-                          if line.startswith("colo="):
-                              return ip, delay, speed, line.split("=")[1].strip()
-              except Exception:
-                  pass
+              headers = {"Host": "1.1.1.1", "User-Agent": "Mozilla/5.0"}
+              
+              async with semaphore:
+                  try:
+                      # 0.8秒极短超时，迅速剔除慢速/不响应节点
+                      async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=0.8)) as resp:
+                          if resp.status == 200:
+                              # 流式逐行读取，匹配到 colo= 立即断开连接
+                              async for line in resp.content:
+                                  line_str = line.decode("utf-8", errors="ignore").strip()
+                                  if line_str.startswith("colo="):
+                                      colo = line_str.split("=")[1].strip()
+                                      return ip, delay, speed, colo
+                  except Exception:
+                      pass
               return ip, delay, speed, None
 
-          with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-              results = executor.map(get_colo, top_probes)
-              for ip, delay, speed, colo in results:
-                  if colo and colo in COLO_TO_REGION:
-                      region = COLO_TO_REGION[colo]
-                      region_grouped[region].append((ip, delay, speed))
+          async def main():
+              # 控制最大并发数为 300
+              semaphore = asyncio.Semaphore(300)
+              connector = aiohttp.TCPConnector(limit=300, ttl_dns_cache=300)
+              
+              async with aiohttp.ClientSession(connector=connector) as session:
+                  tasks = [fetch_colo(session, semaphore, item) for item in top_probes]
+                  results = await asyncio.gather(*tasks)
+                  return results
 
-          output_lines = []
-          # 目标地区加入了 US 和 DE
-          target_regions = ["TW", "SG", "JP", "KR", "AU", "MY", "US", "DE"]
-          
-          assigned_ips = set()
-          for r in target_regions:
-              for item in region_grouped[r]:
-                  assigned_ips.add(item[0])
+          results = asyncio.run(main())
 
-          remaining_ips = [item for item in tested_ips if item[0] not in assigned_ips]
+          us_ips = []
+          for ip, delay, speed, colo in results:
+              if colo and colo in US_COLOS:
+                  us_ips.append((ip, delay, speed))
 
-          for idx, region in enumerate(target_regions):
-              matched = region_grouped[region]
-              flag = FLAG_MAP[region]
+          print(f"Successfully matched {len(us_ips)} verified US IPs via async probing.")
 
-              if len(matched) < 10:
-                  needed = 15 - len(matched)
-                  fill_ips = remaining_ips[:needed]
-                  remaining_ips = remaining_ips[needed:]
-                  matched.extend(fill_ips)
+          # 若验证出的真实 US 节点不足 100 个，使用未匹配 IP 按测速表现补足
+          if len(us_ips) < 100:
+              existing_ips = {item[0] for item in us_ips}
+              for item in tested_ips:
+                  if item[0] not in existing_ips:
+                      us_ips.append(item)
+                      if len(us_ips) >= 100:
+                          break
 
-              sorted_list = sorted(matched, key=lambda x: (-x[2], x[1]))[:20]
-              for ip, delay, speed in sorted_list:
-                  output_lines.append(f"{ip}:443#{region} {flag}")
-              print(f"Region {region}: Extracted {len(sorted_list)} IPs.")
+          # 最终按性能重排并截取前 100 个 IP
+          final_100 = sorted(us_ips, key=lambda x: (-x[2], x[1]))[:100]
+
+          output_lines = [f"{ip}:443#US 🇺🇸" for ip, delay, speed in final_100]
 
           with open("best-cf-ipv4.txt", "w", encoding="utf-8") as f:
               f.write("\n".join(output_lines) + "\n")
 
-          print(f"Successfully generated best-cf-ipv4.txt with {len(output_lines)} total IPs.")
+          print(f"Successfully generated best-cf-ipv4.txt with {len(output_lines)} US IPs.")
           '
 
       - name: Clean Temporary Files
@@ -252,6 +248,6 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes in IP list."
           else
-            git commit -m "auto: update best-cf-ipv4.txt [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+            git commit -m "auto: update top 100 US best-cf-ipv4.txt [$(date -u +'%Y-%m-%d %H:%M UTC')]"
             git push
           fi
