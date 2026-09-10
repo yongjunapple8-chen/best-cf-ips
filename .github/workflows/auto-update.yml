@@ -40,13 +40,14 @@ jobs:
               "https://www.cloudflare.com/ips-v4"
           ]
 
-          # 北美 (US) 核心 Cloudflare 网段
+          # 北美 (US) 核心及广泛兼容的 Cloudflare 网段
           TARGET_CIDRS = [
-              "104.16.0.0/12", 
-              "172.64.0.0/12", 
-              "108.162.192.0/18",
+              "104.16.0.0/13",
+              "104.24.0.0/14",
+              "172.64.0.0/13",
               "162.158.0.0/15",
               "198.41.128.0/17",
+              "108.162.192.0/18",
               "173.245.48.0/20"
           ]
 
@@ -132,7 +133,7 @@ jobs:
             awk -F',' 'NR>1 {print $1","$5",0.00"}' result.csv > "$GITHUB_WORKSPACE/result_parsed.csv"
           fi
 
-      - name: Step 3 - Extract Top 100 Verified US IPs
+      - name: Step 3 - Extract Proxy-Compatible US IPs
         run: |
           python3 -c '
           import os
@@ -161,24 +162,24 @@ jobs:
                       except ValueError:
                           pass
 
-          # 优先按【下载速度降序】，速度相同时按【延迟升序】
           tested_ips = sorted(tested_ips, key=lambda x: (-x[2], x[1]))
           print(f"Total speed tested IPs: {len(tested_ips)}")
 
           top_probes = tested_ips[:2000]
 
-          # 忽略证书域名校验，但保持 TLS 正常握手测试
           ssl_context = ssl.create_default_context()
           ssl_context.check_hostname = False
           ssl_context.verify_mode = ssl.CERT_NONE
 
-          async def verify_ip(session, semaphore, item):
+          async def verify_proxy_ip(session, semaphore, item):
               ip, delay, speed = item
-              # 使用真实 HTTPS + SNI 域名请求，确保端口 443 和 CDN 转发正常
               url = f"https://{ip}/cdn-cgi/trace"
+              # 模拟常用代理工具访问 Cloudflare CDN 节点时的 Websocket / HTTP 头信息
               headers = {
-                  "Host": "dash.cloudflare.com",
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                  "Host": "cp.cloudflare.com",
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                  "Upgrade": "websocket",
+                  "Connection": "Upgrade"
               }
               
               async with semaphore:
@@ -187,25 +188,28 @@ jobs:
                           url, 
                           headers=headers, 
                           ssl=ssl_context, 
-                          server_hostname="dash.cloudflare.com", 
-                          timeout=aiohttp.ClientTimeout(total=1.2)
+                          server_hostname="cp.cloudflare.com", 
+                          timeout=aiohttp.ClientTimeout(total=1.5)
                       ) as resp:
-                          if resp.status == 200:
-                              async for line in resp.content:
-                                  line_str = line.decode("utf-8", errors="ignore").strip()
-                                  if line_str.startswith("colo="):
-                                      colo = line_str.split("=")[1].strip()
-                                      return ip, delay, speed, colo
+                          # 兼容代理标准的 HTTP 状态码 200, 400 (Websocket Upgrade Needed 属于正常处理节点)
+                          if resp.status in (200, 400):
+                              text = await resp.text()
+                              colo = None
+                              for line in text.splitlines():
+                                  if line.startswith("colo="):
+                                      colo = line.split("=")[1].strip()
+                                      break
+                              return ip, delay, speed, colo
                   except Exception:
                       pass
               return ip, delay, speed, None
 
           async def main():
-              semaphore = asyncio.Semaphore(250)
-              connector = aiohttp.TCPConnector(limit=250, ttl_dns_cache=300, ssl=ssl_context)
+              semaphore = asyncio.Semaphore(200)
+              connector = aiohttp.TCPConnector(limit=200, ttl_dns_cache=300, ssl=ssl_context)
               
               async with aiohttp.ClientSession(connector=connector) as session:
-                  tasks = [verify_ip(session, semaphore, item) for item in top_probes]
+                  tasks = [verify_proxy_ip(session, semaphore, item) for item in top_probes]
                   results = await asyncio.gather(*tasks)
                   return results
 
@@ -220,12 +224,10 @@ jobs:
                   if colo in US_COLOS:
                       us_ips.append((ip, delay, speed))
 
-          print(f"Verified HTTPS-accessible Cloudflare IPs: {len(verified_ips)}")
-          print(f"Verified US Region IPs: {len(us_ips)}")
+          print(f"Verified Proxy-accessible IPs: {len(verified_ips)}")
+          print(f"Verified US Region Proxy IPs: {len(us_ips)}")
 
-          # 优先使用通过 HTTPS 验证的 US IP
           final_pool = us_ips
-          # 如果符合 US 且通畅的不足 100 个，用其他通过 HTTPS 验证的真实可用 IP 补齐
           if len(final_pool) < 100:
               existing = {x[0] for x in final_pool}
               for item in verified_ips:
@@ -241,7 +243,7 @@ jobs:
           with open("best-cf-ipv4.txt", "w", encoding="utf-8") as f:
               f.write("\n".join(output_lines) + "\n")
 
-          print(f"Successfully generated best-cf-ipv4.txt with {len(output_lines)} verified usable US IPs.")
+          print(f"Successfully generated best-cf-ipv4.txt with {len(output_lines)} proxy-compatible US IPs.")
           '
 
       - name: Clean Temporary Files
@@ -256,6 +258,6 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes in IP list."
           else
-            git commit -m "auto: update top 100 HTTPS-verified US best-cf-ipv4.txt [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+            git commit -m "auto: update top 100 proxy-verified US best-cf-ipv4.txt [$(date -u +'%Y-%m-%d %H:%M UTC')]"
             git push
           fi
