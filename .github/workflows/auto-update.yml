@@ -17,10 +17,6 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
-        run: |
-          pip install aiohttp
-
       - name: Generate IP & Port Candidate Pool
         run: |
           cat << 'EOF' > generate_ips.py
@@ -29,10 +25,10 @@ jobs:
           import ipaddress
           import urllib.request
 
-          # 1. 硬阻断：拒绝通用 SNI 路由/容易失败的 Cloudflare 专属网段
+          # 1. 硬阻断：拒绝通用 SNI 路由限制严格的专属网段
           EXCLUDE_PREFIXES = ("172.67.", "172.66.", "162.159.", "104.21.")
 
-          # 2. 仅保留兼容性最佳的公共共享 Anycast 网段
+          # 2. 兼容性最佳的公共共享 Anycast 网段
           TARGET_CIDRS = [
               "104.16.0.0/13",
               "104.24.0.0/14",
@@ -51,7 +47,7 @@ jobs:
           ip_pattern = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
           ip_port_set = set()
 
-          # 提取第三方源中的优质 [IP:Port]
+          # 提取第三方源中的 [IP:Port]
           for url in SOURCES:
               try:
                   req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -68,21 +64,21 @@ jobs:
                           else:
                               for ip in ip_pattern.findall(line):
                                   if not ip.startswith(EXCLUDE_PREFIXES):
-                                      # 单纯 IP 不展开多端口，仅保留 8443
                                       ip_port_set.add(f"{ip}:8443")
               except Exception as e:
                   print(f"Fetch {url} notice: {e}")
 
-          # 从官方 CIDR 中抽样优质共享 IP
+          # 从官方 CIDR 中抽样优质共享 IP（覆盖常用的 443 和 8443 端口）
           for cidr in TARGET_CIDRS:
               try:
                   net = ipaddress.ip_network(cidr, strict=False)
                   hosts = list(net.hosts())
-                  sample_size = min(80, len(hosts))
+                  sample_size = min(60, len(hosts))
                   for ip in random.sample(hosts, sample_size):
                       ip_str = str(ip)
                       if not ip_str.startswith(EXCLUDE_PREFIXES):
                           ip_port_set.add(f"{ip_str}:8443")
+                          ip_port_set.add(f"{ip_str}:443")
               except Exception:
                   pass
 
@@ -91,59 +87,56 @@ jobs:
               for item in ip_port_set:
                   f.write(f"{item}\n")
 
-          print(f"Generated {len(ip_port_set)} candidates (Filtered out 172.67/172.66/162.159).")
+          print(f"Generated {len(ip_port_set)} candidate IP:Port targets.")
           EOF
           python generate_ips.py
 
-      - name: Run Speedtest & Filter
+      - name: Run TCP Ping & Filter Best IPs
         run: |
           cat << 'EOF' > test_ips.py
           import asyncio
-          import aiohttp
           import time
 
           EXCLUDE_PREFIXES = ("172.67.", "172.66.", "162.159.", "104.21.")
 
-          async def test_ip(session, ip_port, semaphore):
+          async def tcp_ping(ip_port, semaphore):
               ip, port = ip_port.split(":")
               if ip.startswith(EXCLUDE_PREFIXES):
                   return None
 
-              url = f"https://{ip}:{port}/__down?bytes=10000000"
-              headers = {"Host": "speed.cloudflare.com"}
-
               async with semaphore:
                   start = time.time()
                   try:
-                      # 不验证域名证书以兼容直接 IP 握手，但强制要求返回 200 OK
-                      async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=3.5), ssl=False) as resp:
-                          if resp.status == 200:
-                              delay = round((time.time() - start) * 1000, 2)
-                              return (ip_port, delay)
+                      # 建立 TCP Socket 连接测速
+                      conn = asyncio.open_connection(ip, int(port))
+                      reader, writer = await asyncio.wait_for(conn, timeout=2.5)
+                      delay = round((time.time() - start) * 1000, 2)
+                      writer.close()
+                      await writer.wait_closed()
+                      return (ip_port, delay)
                   except Exception:
-                      pass
-              return None
+                      return None
 
           async def main():
               with open("candidates.txt") as f:
                   candidates = [line.strip() for line in f if line.strip()]
 
-              semaphore = asyncio.Semaphore(120)
-              async with aiohttp.ClientSession() as session:
-                  tasks = [test_ip(session, candidate, semaphore) for candidate in candidates]
-                  results = await asyncio.gather(*tasks)
+              # 并发数设置为 100
+              semaphore = asyncio.Semaphore(100)
+              tasks = [tcp_ping(candidate, semaphore) for candidate in candidates]
+              results = await asyncio.gather(*tasks)
 
               valid_results = [r for r in results if r is not None]
               valid_results.sort(key=lambda x: x[1])
 
-              # 保留延迟最低的前 25 个真实可用节点
-              top_results = valid_results[:25]
+              # 保留延迟最低的前 30 个真实连通节点
+              top_results = valid_results[:30]
               
               with open("best_ips.txt", "w") as f:
                   for ip_port, delay in top_results:
                       f.write(f"{ip_port}#{delay}ms\n")
 
-              print(f"Scan complete. Found {len(valid_results)} usable IPs, saved top {len(top_results)} to best_ips.txt.")
+              print(f"Scan complete. Successfully found {len(valid_results)} active IPs, output top {len(top_results)} to best_ips.txt.")
 
           asyncio.run(main())
           EOF
