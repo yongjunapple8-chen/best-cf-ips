@@ -44,9 +44,9 @@ jobs:
               "https://raw.githubusercontent.com/cmliu/CFip-Merge/main/ip.txt"
           ]
 
-          # 北美 (US) 核心 Anycast 网段
+          # 精细化筛选美西/美东本土 Anycast 核心 CIDR 网段
           TARGET_CIDRS = [
-              "104.16.0.0/13", 
+              "104.16.0.0/14", 
               "104.24.0.0/14", 
               "108.162.192.0/18",
               "162.158.0.0/15",
@@ -140,7 +140,7 @@ jobs:
             awk -F',' 'NR>1 {print $1","$5",0.00"}' result.csv > "$GITHUB_WORKSPACE/result_parsed.csv"
           fi
 
-      - name: Step 3 - Extract Top 100 US IPs
+      - name: Step 3 - Extract Top 100 Strict US IPs
         run: |
           python3 -c '
           import os
@@ -148,6 +148,7 @@ jobs:
           import concurrent.futures
           import json
 
+          # 严格限缩为美国本土核心 Colo 数据中心代号
           US_COLOS = {
               "SJC", "LAX", "SEA", "SFO", "PDX", "ORD", "JFK", "EWR", 
               "IAD", "ATL", "DFW", "IAH", "MIA", "DEN", "PHX", "LAS", 
@@ -176,11 +177,11 @@ jobs:
                       except ValueError:
                           pass
 
-          # 降序按速度，升序按延迟
+          # 优先按速度降序，其次按延迟升序
           tested_targets = sorted(tested_targets, key=lambda x: (-x[2], x[1]))
 
           us_targets = []
-          top_probes = tested_targets[:1200]
+          top_probes = tested_targets[:1500]
 
           def verify_us_colo(item):
               ip, delay, speed = item
@@ -190,40 +191,33 @@ jobs:
                   with urllib.request.urlopen(req, timeout=1.5) as resp:
                       for line in resp.read().decode("utf-8", errors="ignore").splitlines():
                           if line.startswith("colo="):
-                              return ip, delay, speed, line.split("=")[1].strip()
+                              colo = line.split("=")[1].strip()
+                              return ip, delay, speed, colo
               except Exception:
                   pass
               return ip, delay, speed, None
 
-          with concurrent.futures.ThreadPoolExecutor(max_workers=60) as executor:
+          with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
               results = executor.map(verify_us_colo, top_probes)
               for ip, delay, speed, colo in results:
                   if colo and colo in US_COLOS:
-                      us_targets.append((ip, delay, speed))
+                      us_targets.append((ip, delay, speed, colo))
                       if len(us_targets) >= 100:
                           break
 
-          # 不足 100 个时自动使用高速度节点补齐
-          if len(us_targets) < 100:
-              existing = {item[0] for item in us_targets}
-              for item in tested_targets:
-                  if item[0] not in existing:
-                      us_targets.append(item)
-                      if len(us_targets) >= 100:
-                          break
+          # 如果经过严格 Colo 匹配后不足 100 个，仅用已确认的 US 节点导出，确保质量
+          final_targets = sorted(us_targets, key=lambda x: (-x[2], x[1]))[:100]
 
-          final_100 = sorted(us_targets, key=lambda x: (-x[2], x[1]))[:100]
-
-          # 输出格式：IP:端口#🇺🇸 美国
+          # 动态输出格式：包含具体的机房代号，如 IP:8443#🇺🇸 美国 [SJC]
           output_lines = []
-          for ip, delay, speed in final_100:
+          for ip, delay, speed, colo in final_targets:
               port = ip_port_map.get(ip, "8443")
-              output_lines.append(f"{ip}:{port}#🇺🇸 美国")
+              output_lines.append(f"{ip}:{port}#🇺🇸 美国 [{colo}]")
 
           with open("best-cf-ipv4.txt", "w", encoding="utf-8") as f:
               f.write("\n".join(output_lines) + "\n")
 
-          print(f"Successfully generated best-cf-ipv4.txt with {len(output_lines)} US targets.")
+          print(f"Successfully generated best-cf-ipv4.txt with {len(output_lines)} strict US targets.")
           '
 
       - name: Clean Temporary Files
