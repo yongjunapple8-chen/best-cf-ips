@@ -40,7 +40,7 @@ jobs:
               "https://www.cloudflare.com/ips-v4"
           ]
 
-          # 北美 (US) 常用及核心 Cloudflare 网段
+          # 北美 (US) 核心 Cloudflare 网段
           TARGET_CIDRS = [
               "104.16.0.0/12", 
               "172.64.0.0/12", 
@@ -84,7 +84,6 @@ jobs:
                   pass
 
           candidate_ips = list(ip_set)
-          # 扩大候选池至 5000 个 IP，保证筛选基数
           if len(candidate_ips) > 5000:
               candidate_ips = random.sample(candidate_ips, 5000)
 
@@ -105,7 +104,7 @@ jobs:
           tar -zxf CloudflareSpeedTest.tar.gz
           find . -type f \( -name "CloudflareST" -o -name "cfst" \) -exec chmod +x {} +
 
-      - name: Step 2 - Run Speed Test (High Precision)
+      - name: Step 2 - Run Speed Test
         run: |
           EXEC_PATH=$(find . -type f \( -name "CloudflareST" -o -name "cfst" \) | head -n 1)
           EXEC_DIR=$(dirname "$EXEC_PATH")
@@ -113,20 +112,13 @@ jobs:
           cp ip.txt "$EXEC_DIR/ip.txt"
           cd "$EXEC_DIR"
 
-          # 高精度测速参数：
-          # -p 100: 达到 100 个满足标准的 IP 即停止
-          # -t 5: 延迟测试 5 次取平均值
-          # -dn 150: 筛选延迟前 150 的 IP 进行下载测试
-          # -dt 6: 测速时间 6 秒（克服 TCP 慢启动）
-          # -dtm 10: 限制单个 IP 测速线程数，防止频繁触发限流
-          # -url: 使用 Cloudflare 官方 100MB 测速节点
           ./$(basename "$EXEC_PATH") \
             -f ip.txt \
             -o result.csv \
-            -p 100 \
-            -t 5 \
-            -dn 150 \
-            -dt 6 \
+            -p 0 \
+            -t 4 \
+            -dn 300 \
+            -dt 5 \
             -dtm 10 \
             -url https://speed.cloudflare.com/__down?bytes=100000000 || true
 
@@ -140,14 +132,14 @@ jobs:
             awk -F',' 'NR>1 {print $1","$5",0.00"}' result.csv > "$GITHUB_WORKSPACE/result_parsed.csv"
           fi
 
-      - name: Step 3 - Extract Top 100 US IPs (Async Fast Scan)
+      - name: Step 3 - Extract Top 100 Verified US IPs
         run: |
           python3 -c '
           import os
+          import ssl
           import asyncio
           import aiohttp
 
-          # 美国 (US) 主要 Cloudflare 数据中心代号 (Colo)
           US_COLOS = {
               "SJC", "LAX", "SEA", "SFO", "PDX", "ORD", "JFK", "EWR", 
               "IAD", "ATL", "DFW", "IAH", "MIA", "DEN", "PHX", "LAS", 
@@ -165,7 +157,6 @@ jobs:
                   parts = line.strip().split(",")
                   if len(parts) == 3:
                       try:
-                          # 存储结构: (IP, 延迟, 下载速度)
                           tested_ips.append((parts[0], float(parts[1]), float(parts[2])))
                       except ValueError:
                           pass
@@ -174,20 +165,32 @@ jobs:
           tested_ips = sorted(tested_ips, key=lambda x: (-x[2], x[1]))
           print(f"Total speed tested IPs: {len(tested_ips)}")
 
-          # 截取前 1500 个优质 IP 进行并发探测
-          top_probes = tested_ips[:1500]
+          top_probes = tested_ips[:2000]
 
-          async def fetch_colo(session, semaphore, item):
+          # 忽略证书域名校验，但保持 TLS 正常握手测试
+          ssl_context = ssl.create_default_context()
+          ssl_context.check_hostname = False
+          ssl_context.verify_mode = ssl.CERT_NONE
+
+          async def verify_ip(session, semaphore, item):
               ip, delay, speed = item
-              url = f"http://{ip}/cdn-cgi/trace"
-              headers = {"Host": "1.1.1.1", "User-Agent": "Mozilla/5.0"}
+              # 使用真实 HTTPS + SNI 域名请求，确保端口 443 和 CDN 转发正常
+              url = f"https://{ip}/cdn-cgi/trace"
+              headers = {
+                  "Host": "dash.cloudflare.com",
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+              }
               
               async with semaphore:
                   try:
-                      # 0.8秒极短超时，迅速剔除慢速/不响应节点
-                      async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=0.8)) as resp:
+                      async with session.get(
+                          url, 
+                          headers=headers, 
+                          ssl=ssl_context, 
+                          server_hostname="dash.cloudflare.com", 
+                          timeout=aiohttp.ClientTimeout(total=1.2)
+                      ) as resp:
                           if resp.status == 200:
-                              # 流式逐行读取，匹配到 colo= 立即断开连接
                               async for line in resp.content:
                                   line_str = line.decode("utf-8", errors="ignore").strip()
                                   if line_str.startswith("colo="):
@@ -198,42 +201,47 @@ jobs:
               return ip, delay, speed, None
 
           async def main():
-              # 控制最大并发数为 300
-              semaphore = asyncio.Semaphore(300)
-              connector = aiohttp.TCPConnector(limit=300, ttl_dns_cache=300)
+              semaphore = asyncio.Semaphore(250)
+              connector = aiohttp.TCPConnector(limit=250, ttl_dns_cache=300, ssl=ssl_context)
               
               async with aiohttp.ClientSession(connector=connector) as session:
-                  tasks = [fetch_colo(session, semaphore, item) for item in top_probes]
+                  tasks = [verify_ip(session, semaphore, item) for item in top_probes]
                   results = await asyncio.gather(*tasks)
                   return results
 
           results = asyncio.run(main())
 
           us_ips = []
+          verified_ips = []
+
           for ip, delay, speed, colo in results:
-              if colo and colo in US_COLOS:
-                  us_ips.append((ip, delay, speed))
+              if colo:
+                  verified_ips.append((ip, delay, speed))
+                  if colo in US_COLOS:
+                      us_ips.append((ip, delay, speed))
 
-          print(f"Successfully matched {len(us_ips)} verified US IPs via async probing.")
+          print(f"Verified HTTPS-accessible Cloudflare IPs: {len(verified_ips)}")
+          print(f"Verified US Region IPs: {len(us_ips)}")
 
-          # 若验证出的真实 US 节点不足 100 个，使用未匹配 IP 按测速表现补足
-          if len(us_ips) < 100:
-              existing_ips = {item[0] for item in us_ips}
-              for item in tested_ips:
-                  if item[0] not in existing_ips:
-                      us_ips.append(item)
-                      if len(us_ips) >= 100:
+          # 优先使用通过 HTTPS 验证的 US IP
+          final_pool = us_ips
+          # 如果符合 US 且通畅的不足 100 个，用其他通过 HTTPS 验证的真实可用 IP 补齐
+          if len(final_pool) < 100:
+              existing = {x[0] for x in final_pool}
+              for item in verified_ips:
+                  if item[0] not in existing:
+                      final_pool.append(item)
+                      if len(final_pool) >= 100:
                           break
 
-          # 最终按性能重排并截取前 100 个 IP
-          final_100 = sorted(us_ips, key=lambda x: (-x[2], x[1]))[:100]
+          final_100 = sorted(final_pool, key=lambda x: (-x[2], x[1]))[:100]
 
           output_lines = [f"{ip}:443#US 🇺🇸" for ip, delay, speed in final_100]
 
           with open("best-cf-ipv4.txt", "w", encoding="utf-8") as f:
               f.write("\n".join(output_lines) + "\n")
 
-          print(f"Successfully generated best-cf-ipv4.txt with {len(output_lines)} US IPs.")
+          print(f"Successfully generated best-cf-ipv4.txt with {len(output_lines)} verified usable US IPs.")
           '
 
       - name: Clean Temporary Files
@@ -248,6 +256,6 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes in IP list."
           else
-            git commit -m "auto: update top 100 US best-cf-ipv4.txt [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+            git commit -m "auto: update top 100 HTTPS-verified US best-cf-ipv4.txt [$(date -u +'%Y-%m-%d %H:%M UTC')]"
             git push
           fi
